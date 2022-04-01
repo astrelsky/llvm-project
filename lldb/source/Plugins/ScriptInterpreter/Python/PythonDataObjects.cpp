@@ -26,6 +26,17 @@
 
 #include <cstdio>
 
+
+// These aren't exposed to the Py_LIMITED_API
+// even though they are used in exposed functions ¯\_(ツ)_/¯
+#ifndef PyBUF_READ
+#define PyBUF_READ  0x100
+#endif
+
+#ifndef PyBUF_WRITE
+#define PyBUF_WRITE 0x200
+#endif
+
 using namespace lldb_private;
 using namespace lldb;
 using namespace lldb_private::python;
@@ -72,12 +83,6 @@ Expected<std::string> python::As<std::string>(Expected<PythonObject> &&obj) {
 Expected<long long> PythonObject::AsLongLong() const {
   if (!m_py_obj)
     return nullDeref();
-#if PY_MAJOR_VERSION < 3
-  if (!PyLong_Check(m_py_obj)) {
-    PythonInteger i(PyRefType::Borrowed, m_py_obj);
-    return i.AsLongLong();
-  }
-#endif
   assert(!PyErr_Occurred());
   long long r = PyLong_AsLongLong(m_py_obj);
   if (PyErr_Occurred())
@@ -85,17 +90,11 @@ Expected<long long> PythonObject::AsLongLong() const {
   return r;
 }
 
-Expected<long long> PythonObject::AsUnsignedLongLong() const {
+Expected<unsigned long long> PythonObject::AsUnsignedLongLong() const {
   if (!m_py_obj)
     return nullDeref();
-#if PY_MAJOR_VERSION < 3
-  if (!PyLong_Check(m_py_obj)) {
-    PythonInteger i(PyRefType::Borrowed, m_py_obj);
-    return i.AsUnsignedLongLong();
-  }
-#endif
   assert(!PyErr_Occurred());
-  long long r = PyLong_AsUnsignedLongLong(m_py_obj);
+  unsigned long long r = PyLong_AsUnsignedLongLong(m_py_obj);
   if (PyErr_Occurred())
     return exception();
   return r;
@@ -105,12 +104,6 @@ Expected<long long> PythonObject::AsUnsignedLongLong() const {
 Expected<unsigned long long> PythonObject::AsModuloUnsignedLongLong() const {
   if (!m_py_obj)
     return nullDeref();
-#if PY_MAJOR_VERSION < 3
-  if (!PyLong_Check(m_py_obj)) {
-    PythonInteger i(PyRefType::Borrowed, m_py_obj);
-    return i.AsModuloUnsignedLongLong();
-  }
-#endif
   assert(!PyErr_Occurred());
   unsigned long long r = PyLong_AsUnsignedLongLongMask(m_py_obj);
   if (PyErr_Occurred())
@@ -126,20 +119,8 @@ void StructuredPythonObject::Serialize(llvm::json::OStream &s) const {
 
 void PythonObject::Dump(Stream &strm) const {
   if (m_py_obj) {
-    FILE *file = llvm::sys::RetryAfterSignal(nullptr, ::tmpfile);
-    if (file) {
-      ::PyObject_Print(m_py_obj, file, 0);
-      const long length = ftell(file);
-      if (length) {
-        ::rewind(file);
-        std::vector<char> file_contents(length, '\0');
-        const size_t length_read =
-            ::fread(file_contents.data(), 1, file_contents.size(), file);
-        if (length_read > 0)
-          strm.Write(file_contents.data(), length_read);
-      }
-      ::fclose(file);
-    }
+    PythonString repr = Repr();
+    strm.PutCString(repr.GetString());
   } else
     strm.PutCString("NULL");
 }
@@ -158,10 +139,8 @@ PyObjectType PythonObject::GetObjectType() const {
     return PyObjectType::Dictionary;
   if (PythonString::Check(m_py_obj))
     return PyObjectType::String;
-#if PY_MAJOR_VERSION >= 3
   if (PythonBytes::Check(m_py_obj))
     return PyObjectType::Bytes;
-#endif
   if (PythonByteArray::Check(m_py_obj))
     return PyObjectType::ByteArray;
   if (PythonBoolean::Check(m_py_obj))
@@ -369,11 +348,7 @@ StructuredData::StringSP PythonByteArray::CreateStructuredString() const {
 // PythonString
 
 Expected<PythonString> PythonString::FromUTF8(llvm::StringRef string) {
-#if PY_MAJOR_VERSION >= 3
   PyObject *str = PyUnicode_FromStringAndSize(string.data(), string.size());
-#else
-  PyObject *str = PyString_FromStringAndSize(string.data(), string.size());
-#endif
   if (!str)
     return llvm::make_error<PythonException>();
   return Take<PythonString>(str);
@@ -387,33 +362,10 @@ bool PythonString::Check(PyObject *py_obj) {
 
   if (PyUnicode_Check(py_obj))
     return true;
-#if PY_MAJOR_VERSION < 3
-  if (PyString_Check(py_obj))
-    return true;
-#endif
   return false;
 }
 
 void PythonString::Convert(PyRefType &type, PyObject *&py_obj) {
-#if PY_MAJOR_VERSION < 3
-  // In Python 2, Don't store PyUnicode objects directly, because we need
-  // access to their underlying character buffers which Python 2 doesn't
-  // provide.
-  if (PyUnicode_Check(py_obj)) {
-    PyObject *s = PyUnicode_AsUTF8String(py_obj);
-    if (s == nullptr) {
-      PyErr_Clear();
-      if (type == PyRefType::Owned)
-        Py_DECREF(py_obj);
-      return;
-    }
-    if (type == PyRefType::Owned)
-      Py_DECREF(py_obj);
-    else
-      type = PyRefType::Owned;
-    py_obj = s;
-  }
-#endif
 }
 
 llvm::StringRef PythonString::GetString() const {
@@ -425,40 +377,30 @@ llvm::StringRef PythonString::GetString() const {
   return s.get();
 }
 
-Expected<llvm::StringRef> PythonString::AsUTF8() const {
+Expected<std::string> PythonString::AsUTF8() const {
   if (!IsValid())
     return nullDeref();
 
-  Py_ssize_t size;
-  const char *data;
+  PyObject *bytes = PyUnicode_AsUTF8String(m_py_obj);
 
-#if PY_MAJOR_VERSION >= 3
-  data = PyUnicode_AsUTF8AndSize(m_py_obj, &size);
-#else
-  char *c = NULL;
-  int r = PyString_AsStringAndSize(m_py_obj, &c, &size);
-  if (r < 0)
-    c = NULL;
-  data = c;
-#endif
-
-  if (!data)
+  if (!bytes)
     return exception();
 
-  return llvm::StringRef(data, size);
+  // TODO
+  // this will cause a use after free
+  PythonObject data(PyRefType::Owned, bytes);
+  Py_ssize_t size;
+  char **str = nullptr;
+
+  if (PyBytes_AsStringAndSize(bytes, str, &size) == -1)
+    return exception();
+
+  return std::string(*str, size);
 }
 
 size_t PythonString::GetSize() const {
   if (IsValid()) {
-#if PY_MAJOR_VERSION >= 3
-#if PY_MINOR_VERSION >= 3
     return PyUnicode_GetLength(m_py_obj);
-#else
-    return PyUnicode_GetSize(m_py_obj);
-#endif
-#else
-    return PyString_Size(m_py_obj);
-#endif
   }
   return 0;
 }
@@ -487,41 +429,12 @@ bool PythonInteger::Check(PyObject *py_obj) {
   if (!py_obj)
     return false;
 
-#if PY_MAJOR_VERSION >= 3
   // Python 3 does not have PyInt_Check.  There is only one type of integral
   // value, long.
   return PyLong_Check(py_obj);
-#else
-  return PyLong_Check(py_obj) || PyInt_Check(py_obj);
-#endif
 }
 
 void PythonInteger::Convert(PyRefType &type, PyObject *&py_obj) {
-#if PY_MAJOR_VERSION < 3
-  // Always store this as a PyLong, which makes interoperability between Python
-  // 2.x and Python 3.x easier.  This is only necessary in 2.x, since 3.x
-  // doesn't even have a PyInt.
-  if (PyInt_Check(py_obj)) {
-    // Since we converted the original object to a different type, the new
-    // object is an owned object regardless of the ownership semantics
-    // requested by the user.
-    long long value = PyInt_AsLong(py_obj);
-    PyObject *l = nullptr;
-    if (!PyErr_Occurred())
-      l = PyLong_FromLongLong(value);
-    if (l == nullptr) {
-      PyErr_Clear();
-      if (type == PyRefType::Owned)
-        Py_DECREF(py_obj);
-      return;
-    }
-    if (type == PyRefType::Owned)
-      Py_DECREF(py_obj);
-    else
-      type = PyRefType::Owned;
-    py_obj = l;
-  }
-#endif
 }
 
 void PythonInteger::SetInteger(int64_t value) {
@@ -586,7 +499,7 @@ bool PythonList::Check(PyObject *py_obj) {
 
 uint32_t PythonList::GetSize() const {
   if (IsValid())
-    return PyList_GET_SIZE(m_py_obj);
+    return PyList_Size(m_py_obj);
   return 0;
 }
 
@@ -649,7 +562,7 @@ PythonTuple::PythonTuple(std::initializer_list<PyObject *> objects) {
   m_py_obj = PyTuple_New(objects.size());
 
   uint32_t idx = 0;
-  for (auto py_object : objects) {
+  for (auto *py_object : objects) {
     PythonObject object(PyRefType::Borrowed, py_object);
     if (object.IsValid())
       SetItemAtIndex(idx, object);
@@ -665,7 +578,7 @@ bool PythonTuple::Check(PyObject *py_obj) {
 
 uint32_t PythonTuple::GetSize() const {
   if (IsValid())
-    return PyTuple_GET_SIZE(m_py_obj);
+    return PyTuple_Size(m_py_obj);
   return 0;
 }
 
@@ -733,13 +646,9 @@ Expected<PythonObject>
 PythonDictionary::GetItem(const PythonObject &key) const {
   if (!IsValid())
     return nullDeref();
-#if PY_MAJOR_VERSION >= 3
   PyObject *o = PyDict_GetItemWithError(m_py_obj, key.get());
   if (PyErr_Occurred())
     return exception();
-#else
-  PyObject *o = PyDict_GetItem(m_py_obj, key.get());
-#endif
   if (!o)
     return keyError();
   return Retain<PythonObject>(o);
@@ -798,11 +707,7 @@ PythonDictionary::CreateStructuredDictionary() const {
 }
 
 PythonModule PythonModule::BuiltinsModule() {
-#if PY_MAJOR_VERSION >= 3
   return AddModule("builtins");
-#else
-  return AddModule("__builtin__");
-#endif
 }
 
 PythonModule PythonModule::MainModule() { return AddModule("__main__"); }
@@ -851,7 +756,6 @@ bool PythonCallable::Check(PyObject *py_obj) {
   return PyCallable_Check(py_obj);
 }
 
-#if PY_MAJOR_VERSION >= 3 && PY_MINOR_VERSION >= 3
 static const char get_arg_info_script[] = R"(
 from inspect import signature, Parameter, ismethod
 from collections import namedtuple
@@ -873,14 +777,11 @@ def main(f):
             raise Exception(f'unknown parameter kind: {kind}')
     return ArgInfo(count, varargs)
 )";
-#endif
 
 Expected<PythonCallable::ArgInfo> PythonCallable::GetArgInfo() const {
   ArgInfo result = {};
   if (!IsValid())
     return nullDeref();
-
-#if PY_MAJOR_VERSION >= 3 && PY_MINOR_VERSION >= 3
 
   // no need to synchronize access to this global, we already have the GIL
   static PythonScript get_arg_info(get_arg_info_script);
@@ -892,57 +793,6 @@ Expected<PythonCallable::ArgInfo> PythonCallable::GetArgInfo() const {
   bool has_varargs =
       cantFail(As<bool>(pyarginfo.get().GetAttribute("has_varargs")));
   result.max_positional_args = has_varargs ? ArgInfo::UNBOUNDED : count;
-
-#else
-  PyObject *py_func_obj;
-  bool is_bound_method = false;
-  bool is_class = false;
-
-  if (PyType_Check(m_py_obj) || PyClass_Check(m_py_obj)) {
-    auto init = GetAttribute("__init__");
-    if (!init)
-      return init.takeError();
-    py_func_obj = init.get().get();
-    is_class = true;
-  } else {
-    py_func_obj = m_py_obj;
-  }
-
-  if (PyMethod_Check(py_func_obj)) {
-    py_func_obj = PyMethod_GET_FUNCTION(py_func_obj);
-    PythonObject im_self = GetAttributeValue("im_self");
-    if (im_self.IsValid() && !im_self.IsNone())
-      is_bound_method = true;
-  } else {
-    // see if this is a callable object with an __call__ method
-    if (!PyFunction_Check(py_func_obj)) {
-      PythonObject __call__ = GetAttributeValue("__call__");
-      if (__call__.IsValid()) {
-        auto __callable__ = __call__.AsType<PythonCallable>();
-        if (__callable__.IsValid()) {
-          py_func_obj = PyMethod_GET_FUNCTION(__callable__.get());
-          PythonObject im_self = __callable__.GetAttributeValue("im_self");
-          if (im_self.IsValid() && !im_self.IsNone())
-            is_bound_method = true;
-        }
-      }
-    }
-  }
-
-  if (!py_func_obj)
-    return result;
-
-  PyCodeObject *code = (PyCodeObject *)PyFunction_GET_CODE(py_func_obj);
-  if (!code)
-    return result;
-
-  auto count = code->co_argcount;
-  bool has_varargs = !!(code->co_flags & CO_VARARGS);
-  result.max_positional_args =
-      has_varargs ? ArgInfo::UNBOUNDED
-                  : (count - (int)is_bound_method) - (int)is_class;
-
-#endif
 
   return result;
 }
@@ -971,9 +821,6 @@ operator()(std::initializer_list<PythonObject> args) {
 bool PythonFile::Check(PyObject *py_obj) {
   if (!py_obj)
     return false;
-#if PY_MAJOR_VERSION < 3
-  return PyFile_Check(py_obj);
-#else
   // In Python 3, there is no `PyFile_Check`, and in fact PyFile is not even a
   // first-class object type anymore.  `PyFile_FromFd` is just a thin wrapper
   // over `io.open()`, which returns some object derived from `io.IOBase`. As a
@@ -1015,7 +862,7 @@ protected:
 const char *PythonException::toCString() const {
   if (!m_repr_bytes)
     return "unknown exception";
-  return PyBytes_AS_STRING(m_repr_bytes);
+  return PyBytes_AsString(m_repr_bytes);
 }
 
 PythonException::PythonException(const char *caller) {
@@ -1106,7 +953,6 @@ char PythonException::ID = 0;
 
 llvm::Expected<File::OpenOptions>
 GetOptionsForPyObject(const PythonObject &obj) {
-#if PY_MAJOR_VERSION >= 3
   auto options = File::OpenOptions(0);
   auto readable = As<bool>(obj.CallMethod("readable"));
   if (!readable)
@@ -1119,10 +965,6 @@ GetOptionsForPyObject(const PythonObject &obj) {
   if (writable.get())
     options |= File::eOpenOptionWrite;
   return options;
-#else
-  PythonString py_mode = obj.GetAttributeValue("mode").AsType<PythonString>();
-  return File::GetOptionsFromMode(py_mode.GetString());
-#endif
 }
 
 // Base class template for python files.   All it knows how to do
@@ -1206,8 +1048,7 @@ public:
 char SimplePythonFile::ID = 0;
 } // namespace
 
-#if PY_MAJOR_VERSION >= 3
-
+/*
 namespace {
 class PythonBuffer {
 public:
@@ -1241,6 +1082,7 @@ private:
   Py_buffer m_buffer;
 };
 } // namespace
+*/
 
 // Shared methods between TextPythonFile and BinaryPythonFile
 namespace {
@@ -1320,21 +1162,14 @@ public:
   Status Read(void *buf, size_t &num_bytes) override {
     GIL takeGIL;
     static_assert(sizeof(long long) >= sizeof(size_t), "overflow");
-    auto pybuffer_obj =
-        m_py_obj.CallMethod("read", (unsigned long long)num_bytes);
-    if (!pybuffer_obj)
-      return Status(pybuffer_obj.takeError());
-    num_bytes = 0;
-    if (pybuffer_obj.get().IsNone()) {
-      // EOF
-      num_bytes = 0;
-      return Status();
-    }
-    auto pybuffer = PythonBuffer::Create(pybuffer_obj.get());
-    if (!pybuffer)
-      return Status(pybuffer.takeError());
-    memcpy(buf, pybuffer.get().get().buf, pybuffer.get().get().len);
-    num_bytes = pybuffer.get().get().len;
+    PythonObject mv(PyRefType::Owned, PyMemoryView_FromMemory(
+        (char*)buf, num_bytes, PyBUF_WRITE));
+    PythonInteger read_obj = m_py_obj.CallMethod(
+        "readinto", mv.get())->AsType<PythonInteger>();
+    auto nread = read_obj.AsUnsignedLongLong();
+    if (!nread)
+      return Status(nread.takeError());
+    num_bytes = nread.get();
     return Status();
   }
 };
@@ -1391,13 +1226,11 @@ public:
     if (!stringref)
       return Status(stringref.takeError());
     num_bytes = stringref.get().size();
-    memcpy(buf, stringref.get().begin(), num_bytes);
+    std::memcpy(buf, stringref.get().data(), num_bytes);
     return Status();
   }
 };
 } // namespace
-
-#endif
 
 llvm::Expected<FileSP> PythonFile::ConvertToFile(bool borrowed) {
   if (!IsValid())
@@ -1445,13 +1278,6 @@ PythonFile::ConvertToFileForcingUseOfScriptingIOMethods(bool borrowed) {
   if (!IsValid())
     return llvm::createStringError(llvm::inconvertibleErrorCode(),
                                    "invalid PythonFile");
-
-#if PY_MAJOR_VERSION < 3
-
-  return llvm::createStringError(llvm::inconvertibleErrorCode(),
-                                 "not supported on python 2");
-
-#else
 
   int fd = PyObject_AsFileDescriptor(m_py_obj);
   if (fd < 0) {
@@ -1502,8 +1328,6 @@ PythonFile::ConvertToFileForcingUseOfScriptingIOMethods(bool borrowed) {
                                    "invalid File");
 
   return file_sp;
-
-#endif
 }
 
 Expected<PythonFile> PythonFile::FromFile(File &file, const char *mode) {
@@ -1513,10 +1337,8 @@ Expected<PythonFile> PythonFile::FromFile(File &file, const char *mode) {
 
   if (auto *simple = llvm::dyn_cast<SimplePythonFile>(&file))
     return Retain<PythonFile>(simple->GetPythonObject());
-#if PY_MAJOR_VERSION >= 3
   if (auto *pythonio = llvm::dyn_cast<PythonIOFile>(&file))
     return Retain<PythonFile>(pythonio->GetPythonObject());
-#endif
 
   if (!mode) {
     auto m = file.GetOpenMode();
@@ -1526,27 +1348,8 @@ Expected<PythonFile> PythonFile::FromFile(File &file, const char *mode) {
   }
 
   PyObject *file_obj;
-#if PY_MAJOR_VERSION >= 3
   file_obj = PyFile_FromFd(file.GetDescriptor(), nullptr, mode, -1, nullptr,
                            "ignore", nullptr, /*closefd=*/0);
-#else
-  // I'd like to pass ::fflush here if the file is writable,  so that
-  // when the python side destructs the file object it will be flushed.
-  // However, this would be dangerous.    It can cause fflush to be called
-  // after fclose if the python program keeps a reference to the file after
-  // the original lldb_private::File has been destructed.
-  //
-  // It's all well and good to ask a python program not to use a closed file
-  // but asking a python program to make sure objects get released in a
-  // particular order is not safe.
-  //
-  // The tradeoff here is that if a python 2 program wants to make sure this
-  // file gets flushed, they'll have to do it explicitly or wait untill the
-  // original lldb File itself gets flushed.
-  file_obj = PyFile_FromFile(file.GetStream(), py2_const_cast(""),
-                             py2_const_cast(mode), [](FILE *) { return 0; });
-#endif
-
   if (!file_obj)
     return exception();
 
@@ -1591,13 +1394,7 @@ python::runStringOneLine(const llvm::Twine &string,
   if (!code)
     return exception();
   auto code_ref = Take<PythonObject>(code);
-
-#if PY_MAJOR_VERSION < 3
-  PyObject *result =
-      PyEval_EvalCode((PyCodeObject *)code, globals.get(), locals.get());
-#else
   PyObject *result = PyEval_EvalCode(code, globals.get(), locals.get());
-#endif
 
   if (!result)
     return exception();
@@ -1605,6 +1402,8 @@ python::runStringOneLine(const llvm::Twine &string,
   return Take<PythonObject>(result);
 }
 
+
+/*
 llvm::Expected<PythonObject>
 python::runStringMultiLine(const llvm::Twine &string,
                            const PythonDictionary &globals,
@@ -1617,5 +1416,4 @@ python::runStringMultiLine(const llvm::Twine &string,
     return exception();
   return Take<PythonObject>(result);
 }
-
-#endif
+*/

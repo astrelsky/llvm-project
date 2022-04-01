@@ -56,6 +56,7 @@
 #include "lldb-python.h"
 
 #include "lldb/Host/File.h"
+#include "lldb/Utility//StreamString.h"
 #include "lldb/Utility/StructuredData.h"
 
 #include "llvm/ADT/ArrayRef.h"
@@ -193,13 +194,7 @@ inline llvm::Error keyError() {
                                  "key not in dict");
 }
 
-#if PY_MAJOR_VERSION < 3
-// The python 2 API declares some arguments as char* that should
-// be const char *, but it doesn't actually modify them.
-inline char *py2_const_cast(const char *s) { return const_cast<char *>(s); }
-#else
 inline const char *py2_const_cast(const char *s) { return s; }
-#endif
 
 enum class PyInitialValue { Invalid, Empty };
 
@@ -258,10 +253,13 @@ public:
   }
 
   void Dump() const {
-    if (m_py_obj)
-      _PyObject_Dump(m_py_obj);
-    else
+    if (m_py_obj) {
+      StreamString s;
+      Dump(s);
+      puts(s.GetData());
+    } else {
       puts("NULL");
+    }
   }
 
   void Dump(Stream &strm) const;
@@ -363,7 +361,7 @@ public:
 
   llvm::Expected<long long> AsLongLong() const;
 
-  llvm::Expected<long long> AsUnsignedLongLong() const;
+  llvm::Expected<unsigned long long> AsUnsignedLongLong() const;
 
   // wraps on overflow, instead of raising an error.
   llvm::Expected<unsigned long long> AsModuloUnsignedLongLong() const;
@@ -473,7 +471,7 @@ public:
 
   llvm::StringRef GetString() const; // safe, empty string on error
 
-  llvm::Expected<llvm::StringRef> AsUTF8() const;
+  llvm::Expected<std::string> AsUTF8() const;
 
   size_t GetSize() const;
 
